@@ -1,0 +1,16 @@
+/rubi_global_heightmap_wrapper:
+  ros__parameters:
+    input_topic: /elevation_mapping_node/elevation_map_raw
+    input_convention: cupy_rows_y_cols_x
+    output_topic: /rubi/global_elevation/cloud
+    map_frame: map
+    resolution: 0.05
+    origin_x: -25.0
+    origin_y: -25.0
+    length_x: 50.0
+    length_y: 50.0
+    # Initial quality cutoff in m^2; requires calibration on the RUBI input bag.
+    max_variance: 0.04
+    publish_fps: 1.0
+    output_directory: /tmp/rubi_mapping_results
+    load_path: ''

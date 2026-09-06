@@ -1,0 +1,33 @@
+cmake_minimum_required(VERSION 3.16)
+project(rubi_global_heightmap_wrapper)
+
+option(RUBI_BUILD_ROS2 "Build the ROS2 Humble adapter" ON)
+include(CTest)
+add_library(rubi_global_grid src/global_grid.cpp)
+target_include_directories(rubi_global_grid PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(rubi_global_grid PUBLIC cxx_std_17)
+target_compile_options(rubi_global_grid PRIVATE -Wall -Wextra -Wpedantic)
+
+if(BUILD_TESTING)
+  add_executable(global_grid_test test/global_grid_test.cpp)
+  target_link_libraries(global_grid_test rubi_global_grid)
+  add_test(NAME global_grid COMMAND global_grid_test)
+endif()
+
+if(RUBI_BUILD_ROS2)
+  find_package(ament_cmake REQUIRED)
+  find_package(rclcpp REQUIRED)
+  find_package(rcl_interfaces REQUIRED)
+  find_package(grid_map_msgs REQUIRED)
+  find_package(sensor_msgs REQUIRED)
+  find_package(std_srvs REQUIRED)
+  add_executable(global_heightmap_node src/wrapper_node.cpp)
+  target_link_libraries(global_heightmap_node rubi_global_grid)
+  ament_target_dependencies(global_heightmap_node rclcpp rcl_interfaces grid_map_msgs sensor_msgs std_srvs)
+  target_compile_options(global_heightmap_node PRIVATE -Wall -Wextra -Wpedantic)
+  install(TARGETS global_heightmap_node DESTINATION lib/${PROJECT_NAME})
+  install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
+  ament_package()
+endif()

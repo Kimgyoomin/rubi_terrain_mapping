@@ -1,4 +1,26 @@
-# Testing Guide for elevation_mapping_cupy
+# RUBI development
+
+The target is ROS2 Humble. Keep the upstream GPU height estimator and implement
+global persistence in `rubi_global_heightmap_wrapper`; do not replace it with a new
+raw-point CPU fusion algorithm. Keep inherited source notices and document each
+backend change in `docs/rubi/UPSTREAM.md`.
+
+Local checks without ROS/CUDA:
+
+```bash
+cmake -S rubi_global_heightmap_wrapper -B build/rubi-wrapper -DRUBI_BUILD_ROS2=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build/rubi-wrapper -j2
+ctest --test-dir build/rubi-wrapper --output-on-failure
+python3 scripts/test_rubi_backend_contract.py
+```
+
+On Humble, also build/test the ROS wrapper and run
+`python3 scripts/test_rubi_wrapper_ros.py` with the install space sourced.
+The workflow `rubi-humble.yml` covers this without CUDA. The inherited GPU tests
+below require the backend's ROS/CUDA/Python dependencies; report unavailable
+environments explicitly. Do not claim GPU/Orin performance from portable tests.
+
+# Upstream testing guide for elevation_mapping_cupy
 
 ## Running Tests Locally
 

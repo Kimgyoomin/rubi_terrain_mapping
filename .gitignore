@@ -10,3 +10,12 @@ _build
 .vscode*
 *.egg-info
 elevation_mapping_cupy/compile_commands.json
+
+# ROS workspace products and local experiments.
+build/
+install/
+log/
+__pycache__/
+*.db3
+*.mcap
+rubi_results/

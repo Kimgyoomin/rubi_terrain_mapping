@@ -1,0 +1,32 @@
+name: RUBI Humble wrapper
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wrapper:
+    runs-on: ubuntu-22.04
+    container: ros:humble-ros-base-jammy
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install wrapper dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential cmake python3-colcon-common-extensions ros-humble-grid-map-msgs
+      - name: Build and test ROS2 wrapper (no GPU)
+        shell: bash
+        run: |
+          source /opt/ros/humble/setup.bash
+          colcon build --packages-select rubi_global_heightmap_wrapper --cmake-args -DCMAKE_BUILD_TYPE=Release
+          colcon test --packages-select rubi_global_heightmap_wrapper --event-handlers console_direct+
+          colcon test-result --verbose
+          source install/setup.bash
+          python3 scripts/test_rubi_backend_contract.py
+          python3 scripts/test_rubi_wrapper_ros.py

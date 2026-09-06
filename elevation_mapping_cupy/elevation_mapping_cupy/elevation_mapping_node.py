@@ -116,6 +116,7 @@ class ElevationMappingNode(Node):
         self.register_timers()
         self.register_services()
         self._last_t = None
+        self._last_fused_t = None
 
     def initialize_elevation_mapping(self) -> None:
         self.param.update()
@@ -142,6 +143,9 @@ class ElevationMappingNode(Node):
         ).get_parameter_value().string_array_value
         self.initialize_tf_offset = self.get_parameter('initialize_tf_offset').get_parameter_value().double_array_value
         self.map_frame = self.get_parameter('map_frame').get_parameter_value().string_value
+        self.allow_latest_tf_fallback = self.get_parameter(
+            'allow_latest_tf_fallback'
+        ).get_parameter_value().bool_value
         self.base_frame = self.get_parameter('base_frame').get_parameter_value().string_value
         self.corrected_map_frame = self.get_parameter('corrected_map_frame').get_parameter_value().string_value
         self.initialize_method = self.get_parameter('initialize_method').get_parameter_value().string_value
@@ -420,28 +424,22 @@ class ElevationMappingNode(Node):
         )
 
     def publish_map(self, key: str) -> None:
-        if self._map_q is None:
+        if self._map_q is None or self._last_fused_t is None:
             return
         center = self._get_map_center()
         gm = GridMap()
         gm.header.frame_id = self.map_frame
-        gm.header.stamp = self._last_t if self._last_t is not None else self.get_clock().now().to_msg()
+        # A TF-rejected input must not refresh the timestamp of an old map.
+        gm.header.stamp = self._last_fused_t
         gm.info.resolution = self._map.resolution
         actual_map_length = (self._map.cell_n - 2) * self._map.resolution
         gm.info.length_x = actual_map_length
         gm.info.length_y = actual_map_length
-        if self._map_t is not None:
-            gm.info.pose.position.x = self._map_t.x
-            gm.info.pose.position.y = self._map_t.y
-            # grid_map_ros (and our RViz usage) treats GridMap as a horizontal 2.5D surface and ignores pose.z and
-            # pose.orientation. Foxglove's GridMap renderer *does* apply them, which can make the map appear tilted
-            # and shifted in Z when we embed the robot pose here. Keep pose.x/y as the map center in `map_frame`,
-            # but publish a neutral pose for visualization sanity.
-            gm.info.pose.position.z = 0.0
-        else:
-            gm.info.pose.position.x = float(center[0])
-            gm.info.pose.position.y = float(center[1])
-            gm.info.pose.position.z = 0.0
+        # move_to snaps XY to whole cells. The continuous robot position is not
+        # the grid center. Elevation already includes the absolute center Z.
+        gm.info.pose.position.x = float(center[0])
+        gm.info.pose.position.y = float(center[1])
+        gm.info.pose.position.z = 0.0
 
         gm.info.pose.orientation.x = 0.0
         gm.info.pose.orientation.y = 0.0
@@ -553,6 +551,7 @@ class ElevationMappingNode(Node):
                 w=pose_orientation.w,
             )
             self._last_t = self.get_clock().now().to_msg()
+            self._last_fused_t = self._last_t
             self._republish_all_once()
             # Quick sanity: the restored elevation should contain at least some finite values.
             tmp = np.zeros((self._map.cell_n - 2, self._map.cell_n - 2), dtype=np.float32)
@@ -759,6 +758,12 @@ class ElevationMappingNode(Node):
                 time
             )
         except tf2_ros.ExtrapolationException:
+            if not self.allow_latest_tf_fallback:
+                self.get_logger().warning(
+                    f"Stamped transform from '{source_frame}' to '{target_frame}' unavailable; dropping input",
+                    throttle_duration_sec=5.0
+                )
+                return None
             # Time is in the future/past, try with latest available
             try:
                 return self._tf_buffer.lookup_transform(
@@ -849,6 +854,7 @@ class ElevationMappingNode(Node):
             camera_info_msg.width,
         )
         self._image_process_counter += 1
+        self._last_fused_t = camera_msg.header.stamp
 
     def pointcloud_callback(self, msg: PointCloud2, sub_key: str) -> None:
         self._last_t = msg.header.stamp
@@ -934,6 +940,7 @@ class ElevationMappingNode(Node):
 
         self._map.input_pointcloud(pts, channels, R, t_np, 0, 0)
         self._pointcloud_process_counter += 1
+        self._last_fused_t = msg.header.stamp
 
     def pose_update(self) -> None:
         if self._last_t is None:
