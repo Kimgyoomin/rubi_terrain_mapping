@@ -29,7 +29,7 @@
       #   topic_name: '/boxi/hesai/points'
       #   data_type: pointcloud
 
-      subscribers:
+      # subscribers:
       unitree_lidar:
         topic_name: '/unilidar/cloud'
         data_type: pointcloud
