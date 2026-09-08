@@ -56,6 +56,14 @@
     base_frame: 'base_link'                    # The robot's base frame. This frame will be a center of the map.
     corrected_map_frame: 'odom'
     allow_latest_tf_fallback: true                  # RUBI overrides false for stamped registration.
+    # Optional non-blocking stamped-TF queue. Disabled here to preserve the
+    # inherited multi-sensor path; the RUBI single-LiDAR config enables it.
+    stamped_tf_queue_enabled: false
+    tf_wait_timeout: 0.5                            # Steady-time queue residence budget, not a fixed delay.
+    tf_queue_size: 20
+    tf_queue_max_bytes: 67108864                    # Retained PointCloud2 payload only; not process RSS.
+    tf_retry_period: 0.02                           # Steady-time retry timer.
+    tf_max_scans_per_tick: 1
 
     #### Feature toggles ########
     enable_edge_sharpen: false

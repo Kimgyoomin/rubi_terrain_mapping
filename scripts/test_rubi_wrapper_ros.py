@@ -11,6 +11,7 @@ import unittest
 
 import rclpy
 from grid_map_msgs.msg import GridMap
+from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension
 from std_srvs.srv import Trigger
@@ -120,6 +121,79 @@ class WrapperROS(unittest.TestCase):
                     service('load_map')
                     received.clear()
                     pump(lambda: any(m.header.stamp.sec == 2 and m.width == 8 for m in received))
+                finally:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=5)
+                    node.destroy_node()
+                    rclpy.shutdown()
+
+    def test_clock_reset_stops_global_publication(self):
+        with tempfile.TemporaryDirectory(prefix='rubi_wrapper_clock_test_') as directory:
+            os.environ['ROS_DOMAIN_ID'] = '174'
+            rclpy.init()
+            node = rclpy.create_node('rubi_wrapper_clock_test')
+            received = []
+            local_pub = node.create_publisher(GridMap, '/rubi_clock/local', 2)
+            clock_pub = node.create_publisher(Clock, '/clock', 10)
+            sub = node.create_subscription(PointCloud2, '/rubi_clock/global', received.append, 2)
+            del sub
+            log_path = Path(directory) / 'node.log'
+            with log_path.open('w') as log:
+                process = subprocess.Popen([
+                    'ros2', 'run', 'rubi_global_heightmap_wrapper', 'global_heightmap_node',
+                    '--ros-args', '-p', 'use_sim_time:=true',
+                    '-p', 'input_topic:=/rubi_clock/local',
+                    '-p', 'output_topic:=/rubi_clock/global',
+                    '-p', 'origin_x:=-0.1', '-p', 'origin_y:=-0.1',
+                    '-p', 'length_x:=0.2', '-p', 'length_y:=0.2',
+                    '-p', 'publish_fps:=10.0',
+                ], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                try:
+                    def clock(sec):
+                        msg = Clock()
+                        msg.clock.sec = sec
+                        return msg
+
+                    snapshot = GridMap()
+                    snapshot.header.frame_id = 'map'
+                    snapshot.header.stamp.sec = 9
+                    snapshot.info.resolution = .05
+                    snapshot.info.length_x = .1
+                    snapshot.info.length_y = .1
+                    snapshot.info.pose.orientation.w = 1.0
+                    snapshot.layers = ['elevation', 'variance']
+                    snapshot.basic_layers = ['elevation']
+                    for values in ([0., .05, .15, .20], [.001] * 4):
+                        layer = Float32MultiArray()
+                        layer.layout.dim = [
+                            MultiArrayDimension(label='column_index', size=2, stride=4),
+                            MultiArrayDimension(label='row_index', size=2, stride=2),
+                        ]
+                        layer.data = values
+                        snapshot.data.append(layer)
+
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline and not received:
+                        if process.poll() is not None:
+                            self.fail('Wrapper exited: ' + log_path.read_text())
+                        clock_pub.publish(clock(10))
+                        local_pub.publish(snapshot)
+                        rclpy.spin_once(node, timeout_sec=.05)
+                    self.assertTrue(received, log_path.read_text())
+
+                    received.clear()
+                    deadline = time.monotonic() + .6
+                    while time.monotonic() < deadline:
+                        clock_pub.publish(clock(5))
+                        local_pub.publish(snapshot)
+                        rclpy.spin_once(node, timeout_sec=.05)
+                    self.assertEqual(received, [])
+                    self.assertIn('ROS time moved backwards', log_path.read_text())
                 finally:
                     if process.poll() is None:
                         os.killpg(process.pid, signal.SIGTERM)

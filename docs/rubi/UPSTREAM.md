@@ -19,6 +19,28 @@
 3. Add `allow_latest_tf_fallback`. The inherited core configuration retains true;
    RUBI sets false so a timestamp extrapolation does not register a moving cloud
    using a different pose time.
+4. Add an opt-in, non-blocking stamped-TF PointCloud2 queue. RUBI enables the
+   single-XYZ-LiDAR path with bounded FIFO count/payload and steady-time expiry;
+   the inherited image/semantic/multi-sensor path remains separate with the queue
+   disabled by default. Strict queue mode rejects latest fallback and zero stamps.
+5. Couple rolling-map movement and point-cloud fusion in one queued operation:
+   prepare finite XYZ, acquire sensor/base transforms for the same original stamp,
+   call existing `move_to()`, then existing GPU `input_pointcloud()`. The separate
+   pose timer is inert in queue mode. Failed/dropped scans cannot advance the map
+   snapshot stamp; a fusion exception or ROS-clock reversal stops normal output.
+6. Treat rclpy `ExternalShutdownException` as a normal executor shutdown in the
+   mapper and delayed-TF synthetic publisher, so launch-controlled test teardown
+   does not report a false node crash.
+
+The queue and order controller do not alter GPU kernels, sensor-noise equations,
+smoothing, inpainting or traversability. `fused` means the existing GPU API call
+returned without a Python exception; no additional device synchronization was
+added, so it is not proof that all asynchronous CUDA work completed successfully.
+
+The RUBI global wrapper now also installs a ROS-time backward-jump callback. It
+suppresses further input and XYZ publication after a reset until the wrapper and
+local mapper are jointly restarted, preventing an old persistent grid from being
+presented as normal output in a new simulation epoch.
 
 GPU fusion kernels, the sensor noise model, traversability model and Mahalanobis-
 named threshold computation are not rewritten in this bootstrap. Raw-only ROS

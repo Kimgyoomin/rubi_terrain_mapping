@@ -27,6 +27,7 @@ class BackendContract(unittest.TestCase):
         self.sent = []
         return NS(
             _map_q=object(), _last_t='newer rejected input', _last_fused_t='last fused scan',
+            _epoch_faulted=False, _fusion_faulted=False,
             _get_map_center=lambda: [.05, -.1, .7],
             _map_t=NS(x=.069, y=-.081, z=.712),
             _map=NS(resolution=.05, cell_n=162,

@@ -14,6 +14,7 @@ world and shifts correctly as the robot moves (no axis swap).
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -21,6 +22,7 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from rclpy.qos import QoSPresetProfiles
 
 from geometry_msgs.msg import TransformStamped
@@ -106,6 +108,8 @@ class SyntheticPointcloudTfPublisher(Node):
         self.declare_parameter("pointcloud_topic", "/camera/depth/points")
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("sensor_frame", "")
+        self.declare_parameter("tf_delivery_delay_s", 0.0)
         self.declare_parameter("publish_rate_hz", 10.0)
         self.declare_parameter("max_range_m", 6.0)
         self.declare_parameter("front_only", True)
@@ -117,6 +121,10 @@ class SyntheticPointcloudTfPublisher(Node):
         self._topic = self.get_parameter("pointcloud_topic").value
         self._map_frame = self.get_parameter("map_frame").value
         self._base_frame = self.get_parameter("base_frame").value
+        self._sensor_frame = self.get_parameter("sensor_frame").value or self._base_frame
+        self._tf_delivery_delay = float(self.get_parameter("tf_delivery_delay_s").value)
+        if not 0.0 <= self._tf_delivery_delay <= 2.0:
+            raise ValueError("tf_delivery_delay_s must be in [0.0, 2.0]")
         rate_hz = float(self.get_parameter("publish_rate_hz").value)
         self._max_range = float(self.get_parameter("max_range_m").value)
         self._front_only = bool(self.get_parameter("front_only").value)
@@ -130,6 +138,15 @@ class SyntheticPointcloudTfPublisher(Node):
 
         # TF broadcaster for map -> base_link.
         self._tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+        self._static_tf_broadcaster = tf2_ros.StaticTransformBroadcaster(self)
+        if self._sensor_frame != self._base_frame:
+            static_tf = TransformStamped()
+            static_tf.header.stamp = self.get_clock().now().to_msg()
+            static_tf.header.frame_id = self._base_frame
+            static_tf.child_frame_id = self._sensor_frame
+            static_tf.transform.rotation.w = 1.0
+            self._static_tf_broadcaster.sendTransform(static_tf)
+        self._pending_tf = []
 
         # Pointcloud publisher (sensor_data QoS).
         qos = QoSPresetProfiles.get_from_short_key("sensor_data")
@@ -140,10 +157,12 @@ class SyntheticPointcloudTfPublisher(Node):
 
         self._t0 = self.get_clock().now()
         self._timer = self.create_timer(1.0 / rate_hz, self._tick)
+        self._delayed_tf_timer = self.create_timer(0.005, self._publish_due_tf)
 
         self.get_logger().info(
             f"Publishing TF '{self._map_frame}' -> '{self._base_frame}' and PointCloud2 '{self._topic}' "
-            f"in frame '{self._base_frame}' at {rate_hz:.1f} Hz."
+            f"in frame '{self._sensor_frame}' at {rate_hz:.1f} Hz; "
+            f"TF delivery delay={self._tf_delivery_delay:.3f}s."
         )
 
     def _make_static_world(self) -> np.ndarray:
@@ -197,10 +216,21 @@ class SyntheticPointcloudTfPublisher(Node):
         trans, yaw = self._traj.pose_at(t)
         stamp = now.to_msg()
 
-        self._publish_tf(trans, yaw, stamp)
         pts_sensor = self._world_to_sensor_points(trans, yaw)
-        msg = _make_pointcloud2(pts_sensor, frame_id=self._base_frame, stamp=stamp)
+        msg = _make_pointcloud2(pts_sensor, frame_id=self._sensor_frame, stamp=stamp)
+        if self._tf_delivery_delay == 0.0:
+            self._publish_tf(trans, yaw, stamp)
+        else:
+            self._pending_tf.append(
+                (time.monotonic() + self._tf_delivery_delay, trans, yaw, stamp)
+            )
         self._pc_pub.publish(msg)
+
+    def _publish_due_tf(self) -> None:
+        now = time.monotonic()
+        while self._pending_tf and self._pending_tf[0][0] <= now:
+            _, trans, yaw, stamp = self._pending_tf.pop(0)
+            self._publish_tf(trans, yaw, stamp)
 
 
 def main() -> None:
@@ -208,7 +238,7 @@ def main() -> None:
     node = SyntheticPointcloudTfPublisher()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()

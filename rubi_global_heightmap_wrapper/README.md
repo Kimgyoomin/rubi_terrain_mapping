@@ -21,6 +21,11 @@ not a second height estimator or a raw LiDAR mapper.
   0.001 cell (0.05 mm at 5 cm). Misaligned patches are rejected, not interpolated.
 - Frame must match `map_frame`. Positive, increasing snapshot stamps; duplicates
   have no effect and backwards timestamps require an explicit experiment reset.
+- With the RUBI backend queue, the stamp is the original input stamp of the last
+  scan whose stamped sensor/base transforms were both found and whose GPU fusion
+  call returned without an exception. Queue timeout/overflow/invalid inputs do
+  not advance it. This submission acknowledgement is not a CUDA synchronization
+  or a claim that every cell was observed at that time.
 
 The subscriber is best effort with depth 2, compatible with the backend's
 reliable publisher. A dropped local snapshot can lose terrain that exits the
@@ -36,6 +41,11 @@ An invalid local cell marks the corresponding global cell unusable for XYZ,
 while retaining its last accepted height/variance in the saved state. A later
 accepted estimate restores it. This conservative first policy can reduce usable
 coverage on re-entry; it must be measured rather than hidden by filling holes.
+
+When ROS time moves backwards, the wrapper stops accepting local snapshots and
+stops its wall-timer publication. It does not mix a new simulation epoch with
+the retained grid or auto-recover after a clock jump; restart/reset it together
+with the CuPy mapper and planner.
 
 `estimate_snapshot_ns` means the snapshot carrying the estimate, not a measured
 per-cell acquisition time. All scans within a local posterior are correlated.

@@ -3,12 +3,14 @@ import math
 import message_filters
 import numpy as np
 import os
+import time as monotonic_time
 from pathlib import Path
 from functools import partial
 from typing import Dict, List
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from rclpy.qos import QoSPresetProfiles
 from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
@@ -19,6 +21,7 @@ from tf_transformations import quaternion_matrix
 import tf2_ros
 import tf2_py as tf2
 from rclpy.duration import Duration
+from rclpy.clock import Clock, ClockType
 from rclpy.serialization import serialize_message, deserialize_message
 from grid_map_msgs.msg import GridMap
 from grid_map_msgs.srv import SetGridMap, ProcessFile
@@ -30,6 +33,7 @@ import rosbag2_py
 from elevation_mapping_cupy import ElevationMap, Parameter
 from elevation_mapping_cupy.elevation_mapping import GridGeometry
 from elevation_mapping_cupy.gridmap_utils import encode_layer_to_multiarray, decode_multiarray_to_rows_cols
+from elevation_mapping_cupy.stamped_tf_queue import PendingPointCloud, PendingPointCloudQueue
 
 PDC_DATATYPE = {
     "1": np.int8,
@@ -79,9 +83,10 @@ def _pointcloud2_xyz_f32(msg: PointCloud2) -> np.ndarray:
     arr = np.frombuffer(msg.data, dtype=dtype)
     pts = np.stack((arr["x"], arr["y"], arr["z"]), axis=-1).astype(np.float32, copy=False)
 
-    if not msg.is_dense:
-        good = np.isfinite(pts).all(axis=1)
-        pts = pts[good]
+    # Do not trust is_dense blindly: malformed drivers occasionally mark clouds
+    # dense while still carrying NaN/Inf samples.
+    good = np.isfinite(pts).all(axis=1)
+    pts = pts[good]
     return pts
 
 class ElevationMappingNode(Node):
@@ -110,13 +115,14 @@ class ElevationMappingNode(Node):
         # Overwrite subscriber_cfg from loaded YAML
         self.param.subscriber_cfg = self.my_subscribers
 
+        self._last_t = None
+        self._last_fused_t = None
+        self._initialize_input_state()
         self.initialize_elevation_mapping()
         self.register_subscribers()
         self.register_publishers()
         self.register_timers()
         self.register_services()
-        self._last_t = None
-        self._last_fused_t = None
 
     def initialize_elevation_mapping(self) -> None:
         self.param.update()
@@ -134,6 +140,20 @@ class ElevationMappingNode(Node):
     def initialize_ros(self) -> None:
         self._tf_buffer = tf2_ros.Buffer()
         self._listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        # YAML overrides are auto-declared. Explicit defaults keep older configs
+        # (which predate the queue) usable on the inherited non-queued path.
+        queue_defaults = {
+            'stamped_tf_queue_enabled': False,
+            'tf_wait_timeout': 0.5,
+            'tf_queue_size': 20,
+            'tf_queue_max_bytes': 67108864,
+            'tf_retry_period': 0.02,
+            'tf_max_scans_per_tick': 1,
+            'allow_latest_tf_fallback': True,
+        }
+        for name, default in queue_defaults.items():
+            if not self.has_parameter(name):
+                self.declare_parameter(name, default)
         self.get_ros_params()
 
     def get_ros_params(self) -> None:
@@ -146,6 +166,16 @@ class ElevationMappingNode(Node):
         self.allow_latest_tf_fallback = self.get_parameter(
             'allow_latest_tf_fallback'
         ).get_parameter_value().bool_value
+        self.stamped_tf_queue_enabled = self.get_parameter(
+            'stamped_tf_queue_enabled'
+        ).get_parameter_value().bool_value
+        self.tf_wait_timeout = self.get_parameter('tf_wait_timeout').get_parameter_value().double_value
+        self.tf_queue_size = self.get_parameter('tf_queue_size').get_parameter_value().integer_value
+        self.tf_queue_max_bytes = self.get_parameter('tf_queue_max_bytes').get_parameter_value().integer_value
+        self.tf_retry_period = self.get_parameter('tf_retry_period').get_parameter_value().double_value
+        self.tf_max_scans_per_tick = self.get_parameter(
+            'tf_max_scans_per_tick'
+        ).get_parameter_value().integer_value
         self.base_frame = self.get_parameter('base_frame').get_parameter_value().string_value
         self.corrected_map_frame = self.get_parameter('corrected_map_frame').get_parameter_value().string_value
         self.initialize_method = self.get_parameter('initialize_method').get_parameter_value().string_value
@@ -181,6 +211,64 @@ class ElevationMappingNode(Node):
                     self.my_publishers[pub_key] = {}
                 self.my_publishers[pub_key][pub_param] = param_value.value
 
+    def _initialize_input_state(self) -> None:
+        if self.stamped_tf_queue_enabled and self.allow_latest_tf_fallback:
+            raise ValueError(
+                "stamped_tf_queue_enabled and allow_latest_tf_fallback cannot both be true"
+            )
+        if self.tf_wait_timeout <= 0.0 or self.tf_retry_period <= 0.0:
+            raise ValueError("tf_wait_timeout and tf_retry_period must be positive")
+        if self.tf_max_scans_per_tick <= 0:
+            raise ValueError("tf_max_scans_per_tick must be positive")
+
+        if self.stamped_tf_queue_enabled:
+            pointclouds = [
+                (key, cfg) for key, cfg in self.my_subscribers.items()
+                if cfg.get('data_type') == 'pointcloud'
+            ]
+            unsupported = [
+                key for key, cfg in self.my_subscribers.items()
+                if cfg.get('data_type') != 'pointcloud' or cfg.get('channels')
+            ]
+            if len(pointclouds) != 1 or unsupported:
+                raise ValueError(
+                    "stamped TF queue supports exactly one XYZ-only pointcloud subscriber; "
+                    f"pointclouds={len(pointclouds)}, unsupported={unsupported}"
+                )
+
+        self._pending_clouds = PendingPointCloudQueue(
+            self.tf_queue_size, self.tf_queue_max_bytes
+        )
+        self._steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
+        self._last_ros_now_ns = None
+        self._epoch_faulted = False
+        self._fusion_faulted = False
+        self._prepared_pending_stamp_ns = None
+        self._prepared_pending = None
+        self._queue_wait_samples = []
+        self._last_tf_errors = {}
+        self._last_tf_error_stamp_ns = None
+        self._last_received_stamp_ns = None
+        self._input_stats = {
+            'received': 0,
+            'fused': 0,
+            'timeout_drops': 0,
+            'overflow_drops': 0,
+            'invalid_drops': 0,
+            'duplicate_out_of_order_drops': 0,
+            'reset_drops': 0,
+        }
+
+        topics = [
+            str(cfg.get('topic_name', '')) for cfg in self.my_subscribers.values()
+            if cfg.get('data_type') == 'pointcloud'
+        ]
+        self.get_logger().info(
+            "Input configuration: topics=%s map_frame='%s' base_frame='%s' "
+            "stamped_tf_queue_enabled=%s allow_latest_tf_fallback=%s"
+            % (topics, self.map_frame, self.base_frame,
+               self.stamped_tf_queue_enabled, self.allow_latest_tf_fallback)
+        )
 
     def set_param_values_from_ros(self):
         # Assign to self.param so it won't use defaults. This is research code: crash loudly if
@@ -401,6 +489,19 @@ class ElevationMappingNode(Node):
             self.time_interval,
             self.update_time
         )
+        # Queue residence timeout and retry cadence are wall/steady-time based,
+        # so Gazebo pause cannot retain scans forever. TF lookup still uses the
+        # original ROS timestamp carried by each PointCloud2.
+        self.timer_tf_queue = self.create_timer(
+            self.tf_retry_period,
+            self.process_pending_pointclouds,
+            clock=self._steady_clock,
+        )
+        self.timer_input_statistics = self.create_timer(
+            1.0 / max(self.publish_statistics_fps, 0.1),
+            self.publish_input_statistics,
+            clock=self._steady_clock,
+        )
 
     def register_services(self) -> None:
         service_masked = self._resolve_service_name('masked_replace')
@@ -424,7 +525,8 @@ class ElevationMappingNode(Node):
         )
 
     def publish_map(self, key: str) -> None:
-        if self._map_q is None or self._last_fused_t is None:
+        if (self._map_q is None or self._last_fused_t is None or
+                self._epoch_faulted or self._fusion_faulted):
             return
         center = self._get_map_center()
         gm = GridMap()
@@ -856,19 +958,69 @@ class ElevationMappingNode(Node):
         self._image_process_counter += 1
         self._last_fused_t = camera_msg.header.stamp
 
+    @staticmethod
+    def _stamp_to_ns(stamp) -> int:
+        return int(stamp.sec) * 1000000000 + int(stamp.nanosec)
+
+    @staticmethod
+    def _stamp_text(stamp_ns: int) -> str:
+        return f"{stamp_ns // 1000000000}.{stamp_ns % 1000000000:09d}"
+
     def pointcloud_callback(self, msg: PointCloud2, sub_key: str) -> None:
+        self._input_stats['received'] += 1
+        self._last_received_stamp_ns = self._stamp_to_ns(msg.header.stamp)
+        if self.stamped_tf_queue_enabled:
+            self._enqueue_pointcloud(msg, sub_key)
+            return
+
+        # Inherited compatibility path. RUBI does not use this path, but legacy
+        # configurations can keep immediate lookup and opt-in latest fallback.
         self._last_t = msg.header.stamp
+        try:
+            pts, channels = self._prepare_pointcloud(msg, sub_key)
+        except (ValueError, TypeError) as exc:
+            self._input_stats['invalid_drops'] += 1
+            self.get_logger().warning(f"Invalid PointCloud2 input: {exc}")
+            return
+        if pts.size == 0:
+            self._input_stats['invalid_drops'] += 1
+            return
+
+        frame_sensor_id = msg.header.frame_id
+        if not frame_sensor_id:
+            self._input_stats['invalid_drops'] += 1
+            return
+
+        if frame_sensor_id == self.map_frame:
+            t_np = np.zeros(3, dtype=np.float32)
+            R = np.eye(3, dtype=np.float32)
+        else:
+            transform_sensor_to_map = self.safe_lookup_transform(
+                self.map_frame,
+                frame_sensor_id,
+                msg.header.stamp,
+            )
+            if transform_sensor_to_map is None:
+                return
+            t_np, R = self._transform_to_numpy(transform_sensor_to_map)
+
+        self._map.input_pointcloud(pts, channels, R, t_np, 0, 0)
+        self._pointcloud_process_counter += 1
+        self._input_stats['fused'] += 1
+        self._last_fused_t = msg.header.stamp
+
+    def _prepare_pointcloud(self, msg: PointCloud2, sub_key: str):
         additional_channels = list(self.param.subscriber_cfg[sub_key].get("channels", []))
         channels = ["x", "y", "z"] + additional_channels
 
         if additional_channels:
             points = rnp.numpify(msg)
             if points is None:
-                return
+                raise ValueError("ros2_numpy returned no points")
 
             if isinstance(points, dict):
                 if not points:
-                    return
+                    raise ValueError("ros2_numpy returned an empty point dictionary")
                 if "xyz" in points:
                     xyz_array = np.array(points["xyz"])
                     if xyz_array.ndim == 2 and xyz_array.shape[1] == 3:
@@ -901,7 +1053,7 @@ class ElevationMappingNode(Node):
                     pts = np.hstack((pts, data))
             else:
                 if points.size == 0:
-                    return
+                    raise ValueError("cloud is empty")
                 pts = rnp.point_cloud2.get_xyz_points(points)
                 for channel in additional_channels:
                     if not hasattr(points, "dtype") or channel not in points.dtype.names:
@@ -912,37 +1064,245 @@ class ElevationMappingNode(Node):
                     if data.ndim == 1:
                         data = data[:, np.newaxis]
                     pts = np.hstack((pts, data))
+            pts = np.asarray(pts)
+            pts = pts[np.isfinite(pts[:, :3]).all(axis=1)]
         else:
             pts = _pointcloud2_xyz_f32(msg)
-        if pts.size == 0:
+        return pts, channels
+
+    def _enqueue_pointcloud(self, msg: PointCloud2, sub_key: str) -> None:
+        if self._epoch_faulted or self._fusion_faulted:
+            self._input_stats['invalid_drops'] += 1
+            return
+        frame_id = str(msg.header.frame_id).strip()
+        payload_bytes = len(msg.data)
+        stamp_ns = self._stamp_to_ns(msg.header.stamp)
+        if not frame_id or payload_bytes == 0:
+            self._input_stats['invalid_drops'] += 1
             return
 
-        frame_sensor_id = msg.header.frame_id
-        if not frame_sensor_id:
-            raise ValueError("PointCloud2 header.frame_id is empty.")
-
-        if frame_sensor_id == self.map_frame:
-            t_np = np.zeros(3, dtype=np.float32)
-            R = np.eye(3, dtype=np.float32)
-        else:
-            transform_sensor_to_map = self.safe_lookup_transform(
-                self.map_frame,
-                frame_sensor_id,
-                msg.header.stamp,
+        item = PendingPointCloud(
+            message=msg,
+            subscriber_key=sub_key,
+            stamp_ns=stamp_ns,
+            received_monotonic=monotonic_time.monotonic(),
+            payload_bytes=payload_bytes,
+        )
+        result, overflowed = self._pending_clouds.push(item)
+        if result != 'accepted':
+            if result in ('duplicate', 'out_of_order'):
+                self._input_stats['duplicate_out_of_order_drops'] += 1
+            elif result == 'oversize':
+                self._input_stats['overflow_drops'] += 1
+            else:
+                self._input_stats['invalid_drops'] += 1
+            self.get_logger().warning(
+                f"Dropping PointCloud2 stamp={self._stamp_text(stamp_ns)}: {result}",
+                throttle_duration_sec=5.0,
             )
-            if transform_sensor_to_map is None:
-                # Transform not available yet.
-                return
-            t = transform_sensor_to_map.transform.translation
-            q = transform_sensor_to_map.transform.rotation
-            t_np = np.array([t.x, t.y, t.z], dtype=np.float32)
-            R = quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3].astype(np.float32)
+            return
 
-        self._map.input_pointcloud(pts, channels, R, t_np, 0, 0)
-        self._pointcloud_process_counter += 1
-        self._last_fused_t = msg.header.stamp
+        if overflowed:
+            self._input_stats['overflow_drops'] += len(overflowed)
+            overflow_stamps = {d.stamp_ns for d in overflowed}
+            if self._prepared_pending_stamp_ns in overflow_stamps:
+                self._clear_prepared_pending()
+            self.get_logger().warning(
+                "Stamped-TF queue overflow; dropped oldest %d scan(s), pending=%d bytes=%d"
+                % (len(overflowed), len(self._pending_clouds), self._pending_clouds.payload_bytes),
+                throttle_duration_sec=5.0,
+            )
+
+    @staticmethod
+    def _transform_to_numpy(transform):
+        t = transform.transform.translation
+        q = transform.transform.rotation
+        trans = np.array([t.x, t.y, t.z], dtype=np.float32)
+        rot = quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3].astype(np.float32)
+        return trans, rot
+
+    def _lookup_original_stamp(self, source_frame: str, stamp):
+        if source_frame == self.map_frame:
+            return True, None, None
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                self.map_frame, source_frame, stamp
+            )
+            return True, transform, None
+        except Exception as exc:
+            return False, None, str(exc)
+
+    def _clear_prepared_pending(self) -> None:
+        self._prepared_pending_stamp_ns = None
+        self._prepared_pending = None
+
+    def _discard_pending_head(self) -> PendingPointCloud:
+        item = self._pending_clouds.pop()
+        if self._prepared_pending_stamp_ns == item.stamp_ns:
+            self._clear_prepared_pending()
+        return item
+
+    def _observe_ros_clock(self) -> bool:
+        now_ns = self.get_clock().now().nanoseconds
+        if self._last_ros_now_ns is not None and now_ns < self._last_ros_now_ns:
+            dropped = self._pending_clouds.clear()
+            self._clear_prepared_pending()
+            self._input_stats['reset_drops'] += dropped
+            self._epoch_faulted = True
+            self._last_fused_t = None
+            try:
+                self._tf_buffer.clear()
+            except AttributeError:
+                pass
+            self.get_logger().fatal(
+                "ROS time moved backwards (%d -> %d). Fusion and normal publication are stopped; "
+                "restart/reset both elevation_mapping_node and rubi_global_heightmap_wrapper "
+                "before accepting the new epoch." % (self._last_ros_now_ns, now_ns)
+            )
+            return False
+        self._last_ros_now_ns = now_ns
+        return True
+
+    def process_pending_pointclouds(self) -> None:
+        if not self.stamped_tf_queue_enabled:
+            return
+        if self._epoch_faulted or self._fusion_faulted or not self._observe_ros_clock():
+            return
+
+        processed = 0
+        while processed < self.tf_max_scans_per_tick:
+            item = self._pending_clouds.peek()
+            if item is None:
+                return
+            now_monotonic = monotonic_time.monotonic()
+            wait = now_monotonic - item.received_monotonic
+            if wait >= self.tf_wait_timeout:
+                self._discard_pending_head()
+                self._input_stats['timeout_drops'] += 1
+                errors = self._last_tf_errors if self._last_tf_error_stamp_ns == item.stamp_ns else {}
+                sensor_error = errors.get('sensor', 'not checked')
+                base_error = errors.get('base', 'not checked')
+                self.get_logger().warning(
+                    "Stamped TF timeout target='%s' sensor_source='%s' base_source='%s' "
+                    "stamp=%s wait=%.3fs sensor_error=%s base_error=%s"
+                    % (self.map_frame, item.message.header.frame_id, self.base_frame,
+                       self._stamp_text(item.stamp_ns), wait, sensor_error, base_error),
+                    throttle_duration_sec=5.0,
+                )
+                processed += 1
+                continue
+
+            if self._prepared_pending_stamp_ns != item.stamp_ns:
+                try:
+                    pts, channels = self._prepare_pointcloud(item.message, item.subscriber_key)
+                    if pts.size == 0:
+                        raise ValueError("cloud has no finite XYZ points")
+                except Exception as exc:
+                    self._discard_pending_head()
+                    self._input_stats['invalid_drops'] += 1
+                    self.get_logger().warning(
+                        f"Invalid queued PointCloud2 stamp={self._stamp_text(item.stamp_ns)}: {exc}"
+                    )
+                    processed += 1
+                    continue
+                self._prepared_pending_stamp_ns = item.stamp_ns
+                self._prepared_pending = (pts, channels)
+
+            sensor_ready, sensor_tf, sensor_error = self._lookup_original_stamp(
+                item.message.header.frame_id, item.message.header.stamp
+            )
+            base_ready, base_tf, base_error = self._lookup_original_stamp(
+                self.base_frame, item.message.header.stamp
+            )
+            self._last_tf_errors = {'sensor': sensor_error, 'base': base_error}
+            self._last_tf_error_stamp_ns = item.stamp_ns
+            if not sensor_ready or not base_ready:
+                # Return promptly so this SingleThreadedExecutor can receive the
+                # delayed /tf or /tf_static data before the next steady tick.
+                return
+
+            pts, channels = self._prepared_pending
+            try:
+                if base_tf is None:
+                    base_trans = np.zeros(3, dtype=np.float32)
+                    base_rot = np.eye(3, dtype=np.float32)
+                    base_t = Vector3(x=0.0, y=0.0, z=0.0)
+                    base_q = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+                else:
+                    base_trans, base_rot = self._transform_to_numpy(base_tf)
+                    base_t = base_tf.transform.translation
+                    base_q = base_tf.transform.rotation
+                if sensor_tf is None:
+                    sensor_trans = np.zeros(3, dtype=np.float32)
+                    sensor_rot = np.eye(3, dtype=np.float32)
+                else:
+                    sensor_trans, sensor_rot = self._transform_to_numpy(sensor_tf)
+
+                # These calls must remain ordered and use the two transforms
+                # captured above for this exact sensor stamp.
+                self._map.move_to(base_trans, base_rot)
+                self._map.input_pointcloud(pts, channels, sensor_rot, sensor_trans, 0, 0)
+            except Exception as exc:
+                # move_to/input_pointcloud mutate GPU state without rollback.
+                # Never publish that possibly partial state as a normal result.
+                dropped = self._pending_clouds.clear()
+                self._clear_prepared_pending()
+                self._fusion_faulted = True
+                self._last_fused_t = None
+                self.get_logger().fatal(
+                    "GPU fusion submission failed at stamp=%s; stopped fusion/publication "
+                    "because rollback is unavailable (discarded pending=%d): %s"
+                    % (self._stamp_text(item.stamp_ns), dropped, exc)
+                )
+                return
+
+            self._discard_pending_head()
+            self._map_t = base_t
+            self._map_q = base_q
+            self._last_t = item.message.header.stamp
+            self._last_fused_t = item.message.header.stamp
+            self._pointcloud_process_counter += 1
+            self._input_stats['fused'] += 1
+            self._queue_wait_samples.append(wait)
+            if len(self._queue_wait_samples) > 2048:
+                del self._queue_wait_samples[:-2048]
+            self._last_tf_errors = {}
+            self._last_tf_error_stamp_ns = None
+            processed += 1
+
+    def publish_input_statistics(self) -> None:
+        samples = self._queue_wait_samples
+        if samples:
+            p50, p95 = np.percentile(np.asarray(samples), [50, 95])
+            maximum = max(samples)
+        else:
+            p50 = p95 = maximum = 0.0
+        received_ns = self._last_received_stamp_ns
+        fused_ns = None if self._last_fused_t is None else self._stamp_to_ns(self._last_fused_t)
+        self.get_logger().info(
+            "input_stats received=%d fused=%d pending=%d pending_bytes=%d "
+            "timeout_drops=%d overflow_drops=%d invalid_drops=%d "
+            "duplicate_out_of_order_drops=%d reset_drops=%d "
+            "queue_wait_p50=%.3fs p95=%.3fs max=%.3fs last_received_stamp=%s "
+            "last_fused_stamp=%s epoch_faulted=%s fusion_faulted=%s"
+            % (
+                self._input_stats['received'], self._input_stats['fused'],
+                len(self._pending_clouds), self._pending_clouds.payload_bytes,
+                self._input_stats['timeout_drops'], self._input_stats['overflow_drops'],
+                self._input_stats['invalid_drops'],
+                self._input_stats['duplicate_out_of_order_drops'],
+                self._input_stats['reset_drops'], p50, p95, maximum,
+                'none' if received_ns is None else self._stamp_text(received_ns),
+                'none' if fused_ns is None else self._stamp_text(fused_ns),
+                self._epoch_faulted, self._fusion_faulted,
+            )
+        )
 
     def pose_update(self) -> None:
+        if self.stamped_tf_queue_enabled:
+            # Queue mode moves the rolling map immediately before fusion using
+            # the base transform captured for that same scan stamp.
+            return
         if self._last_t is None:
             return
         transform = self.safe_lookup_transform(
@@ -977,7 +1337,7 @@ def main(args=None) -> None:
     executor.add_node(node)
     try:
         executor.spin()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         executor.shutdown()

@@ -4,7 +4,7 @@ ROS2 Humble terrain mapping for RUBI: **reuse CuPy GPU local elevation estimates
 then retain them in a persistent global height map for the existing planner.**
 
 ```text
-MID-360 + FAST-LIO localization / deskewed cloud
+MID-360 corrected raw PointCloud2 + FAST-LIO localization TF
                  ↓
 elevation_mapping_cupy  (GPU height estimation)
                  ↓ raw elevation + variance, map-aligned local grid
@@ -41,6 +41,7 @@ cmake -S rubi_global_heightmap_wrapper -B build/rubi-wrapper \
 cmake --build build/rubi-wrapper -j2
 ctest --test-dir build/rubi-wrapper --output-on-failure
 python3 scripts/test_rubi_backend_contract.py
+python3 scripts/test_stamped_tf_queue.py
 ```
 
 These test grid persistence and integration contracts, not GPU execution or LiDAR
@@ -67,23 +68,26 @@ ros2 launch rubi_mapping_bringup rubi_mapping.launch.py use_sim_time:=true
 ```
 
 This starts the GPU mapper and wrapper. Run the existing simulator and FAST-LIO
-separately. The default input is `/cloud_registered_body`, with `map` as the fixed
-frame and FAST-LIO's lowercase `body` as the tracking frame. Verify these against
-the running system; robot `BODY` and FAST-LIO `body` are not interchangeable.
-Cloud coordinates must agree with their header and timestamp. The world cloud
-in the reviewed FAST-LIO configuration may have 30 cm voxel filtering, which is
-not an appropriate default source for a 5 cm terrain lattice.
+separately. The RUBI YAML default is `/livox/lidar_PointCloud2`, with `map` as the
+fixed frame and `base_link` as the rolling-map frame. It uses a bounded,
+non-blocking queue until both `map <- livox_frame` and `map <- base_link` are
+available at the original scan stamp; latest-TF fallback is disabled. Empty
+`cloud_topic`/`base_frame` launch arguments preserve the selected backend YAML,
+while explicit non-empty CLI values override it.
 
-Stationary GT input can be selected explicitly, after verifying the existing TF:
+An alternate input can be selected explicitly only after verifying its frame and
+timestamp contract:
 
 ```bash
 ros2 launch rubi_mapping_bringup rubi_mapping.launch.py \
-  use_sim_time:=true cloud_topic:=/livox/lidar_PointCloud2 base_frame:=BODY
+  use_sim_time:=true cloud_topic:=/some/verified_cloud base_frame:=base_link
 ```
 
-This does not create a GT bridge or apply another sensor-axis flip. Moving raw
-scans need upstream deskew. GPU noise parameters, body/leg filtering and the
-variance cutoff still require controlled RUBI bag tests.
+This does not create a GT bridge or apply another sensor-axis flip. The queue is
+not point-wise deskew: moving raw scans still need their header timestamp meaning
+and motion distortion validated. GPU noise parameters, body/leg filtering and
+the variance cutoff still require controlled RUBI bag tests. See the
+[stamped-TF runtime guide](docs/rubi/STAMPED_TF_QUEUE.ko.md).
 
 For the existing planner, set
 `input_heightmap_topic: /rubi/global_elevation/cloud` in its full configuration.

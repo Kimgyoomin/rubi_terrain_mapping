@@ -93,9 +93,24 @@ class WrapperNode : public rclcpp::Node {
     load_path_ = setting<std::string>("load_path", "");
     const auto fps = setting<double>("publish_fps", 1.0);
     if (!std::isfinite(fps) || fps <= 0 || fps > 20) throw std::invalid_argument("Invalid publish_fps");
+    rcl_jump_threshold_t jump_threshold{};
+    jump_threshold.on_clock_change = false;
+    jump_threshold.min_backward.nanoseconds = -1;
+    jump_handler_ = get_clock()->create_jump_callback(
+      nullptr,
+      [this](const rcl_time_jump_t& jump) {
+        if (jump.delta.nanoseconds >= 0) return;
+        epoch_faulted_ = true;
+        RCLCPP_FATAL(get_logger(),
+          "ROS time moved backwards by %ld ns. Global input/publication stopped; restart/reset "
+          "both elevation_mapping_node and rubi_global_heightmap_wrapper for the new epoch.",
+          static_cast<long>(jump.delta.nanoseconds));
+      },
+      jump_threshold);
     pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(output, rclcpp::QoS(1).reliable());
     sub_ = create_subscription<grid_map_msgs::msg::GridMap>(input, rclcpp::QoS(2).best_effort(),
       [this](grid_map_msgs::msg::GridMap::ConstSharedPtr msg) {
+        if (epoch_faulted_) return;
         try {
           const auto result = grid_->apply(decode(*msg));
           if (!result.duplicate) dirty_ = true;
@@ -161,7 +176,8 @@ class WrapperNode : public rclcpp::Node {
     return declare_parameter<T>(name, value, descriptor);
   }
   void publish() {
-    if (pub_->get_subscription_count() == 0 || grid_->last_snapshot_ns() <= 0) return;
+    if (epoch_faulted_ || pub_->get_subscription_count() == 0 ||
+        grid_->last_snapshot_ns() <= 0) return;
     if (dirty_) {
       cached_ = sensor_msgs::msg::PointCloud2{};
       cached_.header.frame_id = grid_->geometry().frame;
@@ -189,7 +205,9 @@ class WrapperNode : public rclcpp::Node {
   std::unique_ptr<GlobalGrid> grid_;
   std::string output_directory_, load_path_;
   bool dirty_ = true;
+  bool epoch_faulted_ = false;
   sensor_msgs::msg::PointCloud2 cached_;
+  rclcpp::JumpHandler::SharedPtr jump_handler_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_;
   rclcpp::Subscription<grid_map_msgs::msg::GridMap>::SharedPtr sub_;
   rclcpp::TimerBase::SharedPtr timer_;
